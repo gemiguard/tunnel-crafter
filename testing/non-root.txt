@@ -1,0 +1,7 @@
+Script started on 2025-03-31 06:25:43+00:00 [TERM="xterm-256color" TTY="/dev/pts/0" COLUMNS="137" LINES="76"]
+[?2004h]0;vagrant@tctest: /repo[01;32mvagrant@tctest[00m:[01;34m/repo[00m$ ./vps.sh 
+[?2004l[0;31m[-] This script must be run as root[0m
+[?2004h]0;vagrant@tctest: /repo[01;32mvagrant@tctest[00m:[01;34m/repo[00m$ [?2004l
+exit
+
+Script done on 2025-03-31 06:25:47+00:00 [COMMAND_EXIT_CODE="1"]

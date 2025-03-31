@@ -18,6 +18,7 @@ WG_SERVER_IP="10.10.10.1/24"
 SSH_PORT=22
 INSTALL_NETDATA=true
 ENABLE_SSL=true
+PING_TEST_IP=4.2.2.1
 # Logging functions
 log() { echo -e "${GREEN}[+] $1${NC}"; echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"; }
 error() { echo -e "${RED}[-] $1${NC}"; echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >> "$LOG_FILE"; exit 1; }
@@ -26,7 +27,8 @@ section() { echo -e "\n${BLUE}========= $1 =========${NC}\n"; echo "$(date '+%Y-
 # Check if running as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        error "This script must be run as root"
+      echo -e "${RED}[-] This script must be run as root${NC}"
+      exit 1
     fi
 }
 # Load configuration if exists
@@ -441,7 +443,6 @@ install_netdata() {
     bash <(curl -Ss https://get.netdata.cloud/kickstart.sh) \
         --stable-channel \
         --disable-telemetry \
-        --disable-cloud \
         --dont-wait \
         --no-updates || error "Failed to install Netdata"
     
@@ -675,11 +676,22 @@ get_domains() {
         fi
     fi
 }
+# Test network connectivity
+test_network() {
+  log "Testing network connectivity (to ${PING_TEST_IP})"
+  ping -c3 $PING_TEST_IP -W5 >&/dev/null
+  if [[ $? -eq 0 ]]; then
+    log "Network connectivity OK"
+  else
+    error "Network connectivity test to ${PING_TEST_IP} failed"
+  fi
+}
 # Main execution
 main() {
     check_root
     init_log
     load_config
+    test_network
     get_domains
     install_packages
     setup_unattended_upgrades
