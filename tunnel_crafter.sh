@@ -480,9 +480,10 @@ EOF
 
         NETDATA_AUTH_USER=$(logname 2>/dev/null || echo "$NETDATA_AUTH_USER")
         if [ -z "$NETDATA_AUTH_USER" ] || [ "$NETDATA_AUTH_USER" = "root" ]; then
-            warning "Could not determine sudo user, using 'admin'"
             NETDATA_AUTH_USER="admin"
         fi
+
+        log "Username for netdata login is $NETDATA_AUTH_USER"
 
         # Configure basic HTTP authentication for netdata
         if [ ! "$NETDATA_PASSWORD" ]; then
