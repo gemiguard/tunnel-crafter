@@ -19,6 +19,8 @@ SSH_PORT=22
 INSTALL_NETDATA=true
 ENABLE_SSL=true
 PING_TEST_IP=4.2.2.1
+SSH_PUBLIC_KEY=""
+NETDATA_PASSWORD=""
 # Logging functions
 log() { echo -e "${GREEN}[+] $1${NC}"; echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"; }
 error() { echo -e "${RED}[-] $1${NC}"; echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >> "$LOG_FILE"; exit 1; }
@@ -56,7 +58,7 @@ install_packages() {
     log "Installing required packages..."
     apt install -y sudo curl wget gnupg2 software-properties-common apt-transport-https \
         ca-certificates lsb-release unattended-upgrades fail2ban ufw git \
-        python3 python3-pip python3-venv qrencode wireguard nginx \
+        python3 python3-pip python3-venv qrencode wireguard nginx apache2-utils \
         certbot python3-certbot-nginx zlib1g-dev uuid-dev libuv1-dev \
         liblz4-dev libssl-dev libmnl-dev || error "Failed to install required packages"
     
@@ -155,7 +157,7 @@ AddressFamily inet
 Protocol 2
 HostKey /etc/ssh/ssh_host_rsa_key
 HostKey /etc/ssh/ssh_host_ed25519_key
-PermitRootLogin no
+PermitRootLogin without-password
 MaxAuthTries 3
 MaxSessions 5
 PubkeyAuthentication yes
@@ -203,7 +205,6 @@ EOF
         chown -R "$SUDO_USER:$SUDO_USER" "/home/$SUDO_USER/.ssh"
         
         log "Created user '$SUDO_USER' with password: $USER_PASSWORD"
-        log "IMPORTANT: Add your SSH public key to: /home/$SUDO_USER/.ssh/authorized_keys"
     fi
     
     # Restart SSH service
@@ -473,9 +474,22 @@ EOF
     cloud base url = 
 EOF
     fi
-    
+
     # Configure NGINX for Netdata if SSL is enabled
     if [ "$ENABLE_SSL" = true ] && [ -n "$NETDATA_HOST" ]; then
+
+        NETDATA_AUTH_USER=$(logname 2>/dev/null || echo "$NETDATA_AUTH_USER")
+        if [ -z "$NETDATA_AUTH_USER" ] || [ "$NETDATA_AUTH_USER" = "root" ]; then
+            warning "Could not determine sudo user, using 'admin'"
+            NETDATA_AUTH_USER="admin"
+        fi
+
+        # Configure basic HTTP authentication for netdata
+        if [ ! "$NETDATA_PASSWORD" ]; then
+            log "Prompting for netdata (HTTP basic auth) password for user $NETDATA_AUTH_USER"
+            htpasswd -c /etc/nginx/.htpasswd "$NETDATA_AUTH_USER"
+        fi
+
         log "Setting up NGINX with SSL for Netdata"
         
         cat > /etc/nginx/sites-available/netdata << EOF
@@ -493,6 +507,10 @@ server {
     add_header Referrer-Policy strict-origin-when-cross-origin;
     
     location / {
+
+        auth_basic "Password Required";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+
         proxy_pass http://127.0.0.1:19999;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
@@ -686,6 +704,21 @@ test_network() {
     error "Network connectivity test to ${PING_TEST_IP} failed"
   fi
 }
+# Prompt for authorized (public) key(s) for root
+get_root_pubkey() {
+    if [ ! "$SSH_PUBLIC_KEY" ]; then
+        read -rp "Enter SSH public key(s) for login: " SSH_PUBLIC_KEY
+        if [ -n "$SSH_PUBLIC_KEY" ]; then
+            mkdir -p /root/.ssh >&/dev/null
+            echo "$SSH_PUBLIC_KEY" >> /root/.ssh/authorized_keys
+            chmod 0700 /root/.ssh >&/dev/null
+            chmod 0600 /root/.ssh/authorized_keys >& /dev/null
+            log "SSH authorized (public) key added for root"
+        else
+            warning "No SSH authorized (public) key added for root"
+        fi
+    fi
+}
 # Main execution
 main() {
     check_root
@@ -697,6 +730,7 @@ main() {
     setup_unattended_upgrades
     harden_sysctl
     secure_ssh
+    get_root_pubkey
     setup_firewall
     install_wireguard
     install_wgdashboard
