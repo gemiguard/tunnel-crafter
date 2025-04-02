@@ -13,19 +13,82 @@ NC='\033[0m' # No Color
 CONFIG_FILE="vpn_setup.conf"
 LOG_FILE="/var/log/secure_vpn_setup.log"
 WG_PORT=51820
-WG_NETWORK="10.10.10.0/24"
 WG_SERVER_IP="10.10.10.1/24"
 SSH_PORT=22
 INSTALL_NETDATA=true
 ENABLE_SSL=true
 PING_TEST_IP=4.2.2.1
 SSH_PUBLIC_KEY=""
-NETDATA_PASSWORD=""
+USER_ACCOUNT_NAME=""
+HOST_FQDN=""
+PUBLIC_IP=""
 # Logging functions
 log() { echo -e "${GREEN}[+] $1${NC}"; echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"; }
 error() { echo -e "${RED}[-] $1${NC}"; echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >> "$LOG_FILE"; exit 1; }
 warning() { echo -e "${YELLOW}[!] $1${NC}"; echo "$(date '+%Y-%m-%d %H:%M:%S') - WARNING: $1" >> "$LOG_FILE"; }
 section() { echo -e "\n${BLUE}========= $1 =========${NC}\n"; echo "$(date '+%Y-%m-%d %H:%M:%S') - SECTION: $1" >> "$LOG_FILE"; }
+get_public_ip() {
+    if [ -z "$PUBLIC_IP" ]; then
+        PUBLIC_IP=$(curl -s https://api.ipify.org)
+        if [ -z "$PUBLIC_IP" ]; then
+            warning "Could not determine public IP automatically"
+            read -rp "Please enter your server's public IP address: " PUBLIC_IP
+            if [ -z "$PUBLIC_IP" ]; then
+                error "Public IP is required for VPN setup"
+            fi
+        fi
+    fi
+    log "Using public IP: $PUBLIC_IP"
+}
+reverse_dns_lookup() {
+  ( nslookup "${1}" | grep -e = | awk -F= '{print $2}' | tr -d ' \t' | sed 's/\.$//g' ) 2>/dev/null
+}
+forward_dns_lookup() {
+  ( nslookup "$1" | grep -v '\#' | grep 'Address:' | awk -F ': ' '{print $2}' | tr -d ' \t' ) 2>/dev/null
+}
+ip_matches_hostname() {
+    ( forward_dns_lookup "$2" | grep -Eqi "$1" ) 2>/dev/null
+}
+get_host_fqdn() {
+    if [ ! "$HOST_FQDN" ]; then
+        HOST_FQDN=$(reverse_dns_lookup "$PUBLIC_IP")
+
+        if [ "$HOST_FQDN" ]; then
+            FQDN_PROMPT="Auto-detected hostname is '${HOST_FQDN}', press RETURN to use or enter alternative: "
+        else
+            FQDN_PROMPT="Enter full hostname (host.domain.com) for this system: "
+        fi
+        while true
+        do
+            while true
+            do
+                read -rp "$FQDN_PROMPT" FQDN_RESPONSE
+                if [ "$HOST_FQDN" ] && ! [ "$FQDN_RESPONSE" ]; then
+                    break
+                fi
+                if [ "$FQDN_RESPONSE" ]; then
+                    HOST_FQDN="$FQDN_RESPONSE"
+                    break
+                fi
+            done
+            FQDN_IP=$(forward_dns_lookup "$HOST_FQDN")
+            log "FQDN_IP: ${FQDN_IP}"
+            if ip_matches_hostname "$FQDN_IP" "$HOST_FQDN" ; then
+                log "Accepted entered hostname '${HOST_FQDN}' for public IP '${PUBLIC_IP}'"
+                break
+            fi
+            warning "Hostname '${HOST_FQDN}' does not match public IP '${PUBLIC_IP}'"
+        done
+    else
+        FQDN_IP=$(forward_dns_lookup "$HOST_FQDN")
+        if ip_matches_hostname "$FQDN_IP" "$HOST_FQDN" ; then
+            log "Accepted configured hostname '${HOST_FQDN}' for public IP '${PUBLIC_IP}'"
+        else
+            error "Configured hostname '${HOST_FQDN}' does not match public IP '${PUBLIC_IP}'"
+        fi
+    fi
+
+}
 # Check if running as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -48,6 +111,31 @@ init_log() {
     log "Starting VPS hardening and WireGuard setup..."
     log "Logging to $LOG_FILE"
 }
+# Select user name to use for VPS account and netdata basic auth
+select_user_name() {
+
+    while true
+    do
+        read -rp "Please enter username for VPS user account and Netdata login: " USERNAME_RESPONSE
+        # Check if proposed user name is valid
+        if ! ( echo "$USERNAME_RESPONSE" | grep -Eq '^[a-z][-a-z0-9_]{0,30}\$?$' ); then
+            warning "Entered username '${USERNAME_RESPONSE}' is not valid"
+            continue
+        fi
+        # Ensure proposed username is lower case
+        USERNAME_RESPONSE=$(echo "$USERNAME_RESPONSE" | tr '[:upper:]' '[:lower:]')
+        # Check if proposed user name already exists
+        if ( getent passwd | awk -F: '{print $1}' | grep -qix "$USERNAME" ); then
+            warning "Entered username '${USERNAME_RESPONSE}' already exists"
+            continue
+        fi
+        break
+    done
+
+    USER_ACCOUNT_NAME="$USERNAME_RESPONSE"
+    log "Username for VPS account and Netdata will be '${USER_ACCOUNT_NAME}'"
+}
+
 # Install required packages
 install_packages() {
     section "Installing Required Packages"
@@ -174,37 +262,22 @@ KexAlgorithms curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
 EOF
-    # Determine the sudo user
-    SUDO_USER=$(logname 2>/dev/null || echo "$SUDO_USER")
-    if [ -z "$SUDO_USER" ] || [ "$SUDO_USER" = "root" ]; then
-        warning "Could not determine sudo user, using 'admin'"
-        SUDO_USER="admin"
-    fi
-    log "Using sudo user: $SUDO_USER"
-    
     # Add the user to the sshd_config
-    echo "AllowUsers $SUDO_USER" >> /etc/ssh/sshd_config
+    echo "AllowUsers $USER_ACCOUNT_NAME" >> /etc/ssh/sshd_config
     
     # Create sudo user if it doesn't exist
-    if ! id "$SUDO_USER" &>/dev/null; then
-        log "Creating user: $SUDO_USER"
-        useradd -m -s /bin/bash "$SUDO_USER"
+    if ! id "$USER_ACCOUNT_NAME" &>/dev/null; then
+        log "Creating user: $USER_ACCOUNT_NAME"
+        useradd -m -s /bin/bash "$USER_ACCOUNT_NAME"
         
         # Generate a strong random password
         USER_PASSWORD=$(tr -dc 'A-Za-z0-9!"#$%&'\''()*+,-./:;<=>?@[\]^_`{|}~' </dev/urandom | head -c 16)
-        echo "$SUDO_USER:$USER_PASSWORD" | chpasswd
+        echo "$USER_ACCOUNT_NAME:$USER_PASSWORD" | chpasswd
         
         # Add user to sudo group
-        usermod -aG sudo "$SUDO_USER"
+        usermod -aG sudo "$USER_ACCOUNT_NAME"
         
-        # Set up SSH key authentication for the new user
-        mkdir -p "/home/$SUDO_USER/.ssh"
-        chmod 700 "/home/$SUDO_USER/.ssh"
-        touch "/home/$SUDO_USER/.ssh/authorized_keys"
-        chmod 600 "/home/$SUDO_USER/.ssh/authorized_keys"
-        chown -R "$SUDO_USER:$SUDO_USER" "/home/$SUDO_USER/.ssh"
-        
-        log "Created user '$SUDO_USER' with password: $USER_PASSWORD"
+        log "Created user '$USER_ACCOUNT_NAME' with password: $USER_PASSWORD"
     fi
     
     # Restart SSH service
@@ -225,12 +298,7 @@ setup_firewall() {
     ufw allow "$WG_PORT"/udp comment 'WireGuard VPN'
     ufw allow 80/tcp comment 'HTTP'
     ufw allow 443/tcp comment 'HTTPS'
-    ufw allow 10086/tcp comment 'WGDashboard'
-    
-    if [ "$INSTALL_NETDATA" = true ]; then
-        ufw allow 19999/tcp comment 'Netdata'
-    fi
-    
+
     # Enable UFW
     log "Enabling UFW firewall"
     echo "y" | ufw enable
@@ -271,19 +339,6 @@ install_wireguard() {
     
     SERVER_PRIVATE_KEY=$(cat /etc/wireguard/server.key)
     SERVER_PUBLIC_KEY=$(cat /etc/wireguard/server.pub)
-    
-    # Determine public IP if not set
-    if [ -z "$PUBLIC_IP" ]; then
-        PUBLIC_IP=$(curl -s https://api.ipify.org)
-        if [ -z "$PUBLIC_IP" ]; then
-            warning "Could not determine public IP automatically"
-            read -rp "Please enter your server's public IP address: " PUBLIC_IP
-            if [ -z "$PUBLIC_IP" ]; then
-                error "Public IP is required for VPN setup"
-            fi
-        fi
-        log "Using public IP: $PUBLIC_IP"
-    fi
     
     # Determine default interface
     DEFAULT_INTERFACE=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
@@ -387,45 +442,7 @@ EOF
     systemctl daemon-reload
     systemctl enable wgdashboard
     systemctl start wgdashboard
-    
-    # Configure NGINX if SSL is enabled
-    if [ "$ENABLE_SSL" = true ] && [ -n "$DASHBOARD_HOST" ]; then
-        log "Setting up NGINX with SSL for WGDashboard"
-        
-        cat > /etc/nginx/sites-available/wgdashboard << EOF
-server {
-    listen 80;
-    server_name $DASHBOARD_HOST;
-    
-    location / {
-        proxy_pass http://127.0.0.1:10086;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_cache_bypass \$http_upgrade;
-        
-        # Security headers
-        add_header X-Content-Type-Options nosniff;
-        add_header X-XSS-Protection "1; mode=block";
-        add_header X-Frame-Options SAMEORIGIN;
-        add_header Referrer-Policy strict-origin-when-cross-origin;
-    }
-}
-EOF
-        
-        # Enable site
-        ln -sf /etc/nginx/sites-available/wgdashboard /etc/nginx/sites-enabled/
-        
-        # Test and restart NGINX
-        nginx -t
-        systemctl restart nginx
-        
-        # Get SSL certificate
-        log "Getting SSL certificate from Let's Encrypt"
-        certbot --nginx -d "$DASHBOARD_HOST" --non-interactive --agree-tos --email "admin@$DASHBOARD_HOST" || warning "SSL certificate setup failed"
-    fi
-    
+
     log "WGDashboard installation completed"
 }
 # Install Netdata monitoring
@@ -460,7 +477,7 @@ install_netdata() {
     web files group = root
 [web]
     default port = 19999
-    allow connections from = localhost *
+    allow connections from = localhost
 EOF
     fi
     
@@ -475,95 +492,6 @@ EOF
 EOF
     fi
 
-    # Configure NGINX for Netdata if SSL is enabled
-    if [ "$ENABLE_SSL" = true ] && [ -n "$NETDATA_HOST" ]; then
-
-        NETDATA_AUTH_USER=$(logname 2>/dev/null || echo "$NETDATA_AUTH_USER")
-        if [ -z "$NETDATA_AUTH_USER" ] || [ "$NETDATA_AUTH_USER" = "root" ]; then
-            NETDATA_AUTH_USER="admin"
-        fi
-
-        log "Username for netdata login is $NETDATA_AUTH_USER"
-
-        # Configure basic HTTP authentication for netdata
-        if [ ! "$NETDATA_PASSWORD" ]; then
-            log "Prompting for netdata (HTTP basic auth) password for user $NETDATA_AUTH_USER"
-            htpasswd -c /etc/nginx/.htpasswd "$NETDATA_AUTH_USER"
-        fi
-
-        log "Setting up NGINX with SSL for Netdata"
-        
-        cat > /etc/nginx/sites-available/netdata << EOF
-server {
-    listen 80;
-    server_name $NETDATA_HOST;
-    
-    access_log /var/log/nginx/netdata.access.log;
-    error_log /var/log/nginx/netdata.error.log;
-    
-    # Security headers
-    add_header X-Content-Type-Options nosniff;
-    add_header X-XSS-Protection "1; mode=block";
-    add_header X-Frame-Options SAMEORIGIN;
-    add_header Referrer-Policy strict-origin-when-cross-origin;
-    
-    location / {
-
-        auth_basic "Password Required";
-        auth_basic_user_file /etc/nginx/.htpasswd;
-
-        proxy_pass http://127.0.0.1:19999;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_cache_bypass \$http_upgrade;
-        proxy_buffering off;
-        
-        # Timeout settings
-        proxy_connect_timeout 300s;
-        proxy_read_timeout 300s;
-    }
-}
-EOF
-        
-        # Enable site
-        ln -sf /etc/nginx/sites-available/netdata /etc/nginx/sites-enabled/
-        
-        # Test and restart NGINX
-        nginx -t
-        systemctl restart nginx
-        
-        # Get SSL certificate
-        log "Getting SSL certificate from Let's Encrypt for Netdata"
-        certbot --nginx -d "$NETDATA_HOST" --non-interactive --agree-tos --email "admin@$NETDATA_HOST" || warning "SSL certificate setup for Netdata failed"
-        
-        # Add strong SSL configuration
-        if ! grep -q "ssl_protocols" /etc/nginx/sites-available/netdata; then
-            # Add strong SSL configuration to the server block
-            sed -i '/server_name/a \
-    # SSL configuration\
-    ssl_protocols TLSv1.2 TLSv1.3;\
-    ssl_prefer_server_ciphers on;\
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;\
-    ssl_session_timeout 1d;\
-    ssl_session_cache shared:SSL:10m;\
-    ssl_session_tickets off;\
-    ssl_stapling on;\
-    ssl_stapling_verify on;\
-    resolver 1.1.1.1 8.8.8.8 valid=300s;\
-    resolver_timeout 5s;\
-    # Add HSTS header with a 1 year max-age\
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;' /etc/nginx/sites-available/netdata
-            
-            # Test and reload nginx
-            nginx -t && systemctl reload nginx
-        fi
-    fi
-    
     # Restart Netdata
     systemctl restart netdata
     
@@ -580,13 +508,15 @@ create_credentials() {
 VPS SECURITY & WIREGUARD SETUP INFORMATION
 ========================================================
 Setup Date: $(date)
+Host FQDN: $HOST_FQDN
 Public IP: $PUBLIC_IP
 --------------------------------------------------------
 SSH ACCESS
 --------------------------------------------------------
 SSH Port: $SSH_PORT
-Username: $SUDO_USER
+Username: $USER_ACCOUNT_NAME
 $(if [ -n "$USER_PASSWORD" ]; then echo "Initial Password: $USER_PASSWORD (CHANGE IMMEDIATELY!)"; fi)
+$(if [ "$SSH_PUBLIC_KEY" ]; then echo "SSH public key has been installed for root and $USER_ACCOUNT_NAME"; fi)
 --------------------------------------------------------
 WIREGUARD SERVER
 --------------------------------------------------------
@@ -605,9 +535,9 @@ QR Code: /etc/wireguard/clients/client1_qr.txt
 WGDASHBOARD ACCESS
 --------------------------------------------------------
 $(if [ "$ENABLE_SSL" = true ] && [ -n "$DASHBOARD_HOST" ]; then
-    echo "URL: https://$DASHBOARD_HOST"
+    echo "URL: https://${HOST_FQDN}/wgdashboard/"
 else
-    echo "URL: http://$PUBLIC_IP:10086"
+    echo "URL: http://${HOST_FQDN}/wgdashboard/"
 fi)
 Default Username: admin
 Default Password: admin (CHANGE IMMEDIATELY!)
@@ -616,16 +546,17 @@ echo "--------------------------------------------------------
 NETDATA MONITORING
 --------------------------------------------------------"
 if [ "$ENABLE_SSL" = true ] && [ -n "$NETDATA_HOST" ]; then
-    echo "URL: https://$NETDATA_HOST"
+    echo "URL: https://${HOST_FQDN}/netdata/"
 else
-    echo "URL: http://$PUBLIC_IP:19999"
+    echo "URL: http://${HOST_FQDN}/netdata/"
 fi
+echo "PW protected netdata login account: $USER_ACCOUNT_NAME"
 fi)
 --------------------------------------------------------
 SECURITY INFORMATION
 --------------------------------------------------------
 Firewalls: UFW enabled, Fail2Ban active
-SSH root login: Disabled
+SSH root login: Enabled with SSH key only (not with password)
 Password authentication: Disabled
 Automatic updates: Enabled
 ========================================================
@@ -654,16 +585,16 @@ WireGuard client configuration can be found at:
 /etc/wireguard/clients/client1.conf
 You can access WGDashboard at:
 $(if [ "$ENABLE_SSL" = true ] && [ -n "$DASHBOARD_HOST" ]; then
-    echo "https://$DASHBOARD_HOST"
+    echo "URL: https://${HOST_FQDN}/wgdashboard/"
 else
-    echo "http://$PUBLIC_IP:10086"
+    echo "URL: http://${HOST_FQDN}/wgdashboard/"
 fi)
 $(if [ "$INSTALL_NETDATA" = true ]; then
 echo "You can access Netdata monitoring at:"
 if [ "$ENABLE_SSL" = true ] && [ -n "$NETDATA_HOST" ]; then
-    echo "https://$NETDATA_HOST"
+    echo "URL: https://${HOST_FQDN}/netdata/"
 else
-    echo "http://$PUBLIC_IP:19999"
+    echo "URL: http://${HOST_FQDN}/netdata/"
 fi
 fi)
 IMPORTANT SECURITY NOTES:
@@ -675,49 +606,180 @@ Thank you for using this script!
 EOF
 }
 # Get domain names
-get_domains() {
-    section "Domain Configuration"
-    
-    if [ "$ENABLE_SSL" = true ] && [ -z "$DASHBOARD_HOST" ]; then
-        read -rp "Enter domain name for WGDashboard (leave empty to skip SSL): " DASHBOARD_HOST
-        if [ -n "$DASHBOARD_HOST" ]; then
-            log "Using domain for WGDashboard: $DASHBOARD_HOST"
-            if [ "$INSTALL_NETDATA" = true ]; then
-                read -rp "Enter domain name for Netdata (leave empty to use default subdomain): " NETDATA_HOST
-                if [ -z "$NETDATA_HOST" ]; then
-                    NETDATA_HOST="netdata.$DASHBOARD_HOST"
-                fi
-                log "Using domain for Netdata: $NETDATA_HOST"
-            fi
-        else
-            ENABLE_SSL=false
-            warning "SSL setup skipped - no domain provided"
-        fi
-    fi
-}
 # Test network connectivity
 test_network() {
   log "Testing network connectivity (to ${PING_TEST_IP})"
-  ping -c3 $PING_TEST_IP -W5 >&/dev/null
-  if [[ $? -eq 0 ]]; then
+  if ( ping -c3 $PING_TEST_IP -W5 >&/dev/null ); then
     log "Network connectivity OK"
   else
     error "Network connectivity test to ${PING_TEST_IP} failed"
   fi
 }
 # Prompt for authorized (public) key(s) for root
-get_root_pubkey() {
+get_pubkey() {
     if [ ! "$SSH_PUBLIC_KEY" ]; then
-        read -rp "Enter SSH public key(s) for login: " SSH_PUBLIC_KEY
-        if [ -n "$SSH_PUBLIC_KEY" ]; then
-            mkdir -p /root/.ssh >&/dev/null
-            echo "$SSH_PUBLIC_KEY" >> /root/.ssh/authorized_keys
-            chmod 0700 /root/.ssh >&/dev/null
-            chmod 0600 /root/.ssh/authorized_keys >& /dev/null
-            log "SSH authorized (public) key added for root"
-        else
-            warning "No SSH authorized (public) key added for root"
-        fi
+        read -rp "Enter SSH public key for login: " SSH_PUBLIC_KEY
+    fi
+}
+# Install SSH public key
+install_user_ssh_pubkey() {
+    mkdir -p "${2}/.ssh" >&/dev/null
+    echo "$3" >> "${2}/.ssh/authorized_keys"
+    chown "${1}:${1}" "${2}/.ssh" >&/dev/null
+    chown "${1}:${1}" "${2}/.ssh/authorized_keys" >& /dev/null
+    chmod 0700 "${2}/.ssh" >&/dev/null
+    chmod 0600 "${2}/.ssh/authorized_keys" >& /dev/null
+    log "SSH authorized (public) key added for $1"
+}
+# Preconfigure postfix settings to avoid annoying dialog box
+preseed_postfix_settings() {
+    echo "postfix postfix/main_mailer_type select No configuration" | debconf-set-selections
+    echo "postfix postfix/mailname string $(hostname).localdomain" | debconf-set-selections
+}
+configure_nginx() {
+
+    log "Username for netdata login is $USER_ACCOUNT_NAME"
+
+    log "Prompting for netdata (HTTP basic auth) password for user $USER_ACCOUNT_NAME"
+    htpasswd -c /etc/nginx/.htpasswd "$USER_ACCOUNT_NAME" || error "Failed to set password for netdata web access"
+
+    cat > /etc/nginx/sites-available/default << EOF
+
+upstream netdatabackend {
+    server 127.0.0.1:19999;
+    keepalive 1024;
+}
+
+upstream wgdashboard {
+    server 127.0.0.1:10086;
+    keepalive 1024;
+}
+
+server {
+	listen 80 default_server;
+	listen [::]:80 default_server;
+
+	# SSL configuration
+	#
+	# listen 443 ssl default_server;
+	# listen [::]:443 ssl default_server;
+	#
+	# Note: You should disable gzip for SSL traffic.
+	# See: https://bugs.debian.org/773332
+	#
+	# Read up on ssl_ciphers to ensure a secure configuration.
+	# See: https://bugs.debian.org/765782
+	#
+	# Self signed certs generated by the ssl-cert package
+	# Don't use them in a production server!
+	#
+	# include snippets/snakeoil.conf;
+
+	server_name _;
+
+  # Security headers
+  add_header X-Content-Type-Options nosniff;
+  add_header X-XSS-Protection "1; mode=block";
+  add_header X-Frame-Options SAMEORIGIN;
+  add_header Referrer-Policy strict-origin-when-cross-origin;
+
+
+location = /wgdashboard {
+        return 301 /wgdashboard/;
+}
+
+location ~ /wgdashboard/(?<wgdpath>.*) {
+
+        proxy_redirect off;
+        proxy_set_header Host \$host;
+
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Server \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_http_version 1.1;
+        proxy_pass_request_headers on;
+        proxy_set_header Connection "keep-alive";
+        proxy_store off;
+        proxy_pass http://wgdashboard/\$wgdpath\$is_args\$args;
+
+        gzip on;
+        gzip_proxied any;
+        gzip_types *;
+
+
+        access_log /var/log/nginx/wgdashboard.access.log;
+        error_log /var/log/nginx/wgdashboard.error.log;
+
+  }
+
+location = /netdata {
+        return 301 /netdata/;
+}
+
+location ~ /netdata/(?<ndpath>.*) {
+
+        auth_basic "Password Required";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+
+        proxy_redirect off;
+        proxy_set_header Host \$host;
+
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Server \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_http_version 1.1;
+        proxy_pass_request_headers on;
+        proxy_set_header Connection "keep-alive";
+        proxy_store off;
+        proxy_pass http://netdatabackend/\$ndpath\$is_args\$args;
+
+        gzip on;
+        gzip_proxied any;
+        gzip_types *;
+
+
+        # Timeout settings
+        proxy_connect_timeout 300s;
+        proxy_read_timeout 300s;
+
+        access_log /var/log/nginx/netdata.access.log;
+        error_log /var/log/nginx/netdata.error.log;
+
+    }
+
+
+}
+EOF
+
+    # Test and restart NGINX
+    nginx -t || error "NGINX config test failure #1"
+    systemctl restart nginx || error "NGINX restart failure #1"
+
+    # Get SSL certificate
+    log "Getting SSL certificate from Let's Encrypt"
+    certbot --nginx -d "$HOST_FQDN" --non-interactive --agree-tos --email "root@$HOST_FQDN" || warning "SSL certificate setup failed"
+
+    # Add strong SSL configuration
+    if ! grep -q "ssl_protocols" /etc/nginx/sites-available/netdata; then
+        # Add strong SSL configuration to the server block
+        sed -i '/server_name/a \
+    # SSL configuration\
+    ssl_protocols TLSv1.2 TLSv1.3;\
+    ssl_prefer_server_ciphers on;\
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;\
+    ssl_session_timeout 1d;\
+    ssl_session_cache shared:SSL:10m;\
+    ssl_session_tickets off;\
+    ssl_stapling on;\
+    ssl_stapling_verify on;\
+    resolver 1.1.1.1 8.8.8.8 valid=300s;\
+    resolver_timeout 5s;\
+    # Add HSTS header with a 1 year max-age\
+    #add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;' /etc/nginx/sites-available/netdata
+
+        # Test and restart NGINX
+        nginx -t || error "NGINX config test failure #2"
+        systemctl restart nginx || error "NGINX restart failure #2"
     fi
 }
 # Main execution
@@ -726,12 +788,17 @@ main() {
     init_log
     load_config
     test_network
-    get_domains
+    preseed_postfix_settings
+    get_public_ip
+    get_host_fqdn
     install_packages
     setup_unattended_upgrades
     harden_sysctl
+    select_user_name
     secure_ssh
-    get_root_pubkey
+    get_pubkey
+    install_user_ssh_pubkey root /root "$SSH_PUBLIC_KEY"
+    install_user_ssh_pubkey "$USER_ACCOUNT_NAME" "/home/$USER_ACCOUNT_NAME" "$SSH_PUBLIC_KEY"
     setup_firewall
     install_wireguard
     install_wgdashboard
@@ -740,6 +807,7 @@ main() {
         install_netdata
     fi
     
+    configure_nginx
     create_credentials
     show_completion
     log "Installation completed successfully"
