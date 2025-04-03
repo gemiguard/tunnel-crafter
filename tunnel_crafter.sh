@@ -298,6 +298,7 @@ setup_firewall() {
     ufw allow "$WG_PORT"/udp comment 'WireGuard VPN'
     ufw allow 80/tcp comment 'HTTP'
     ufw allow 443/tcp comment 'HTTPS'
+    ufw allow 10086/tcp comment 'wgdashboard'
 
     # Enable UFW
     log "Enabling UFW firewall"
@@ -535,9 +536,9 @@ QR Code: /etc/wireguard/clients/client1_qr.txt
 WGDASHBOARD ACCESS
 --------------------------------------------------------
 $(if [ "$ENABLE_SSL" = true ] && [ -n "$DASHBOARD_HOST" ]; then
-    echo "URL: https://${HOST_FQDN}/wgdashboard/"
+    echo "URL: https://${HOST_FQDN}:10086"
 else
-    echo "URL: http://${HOST_FQDN}/wgdashboard/"
+    echo "URL: http://${HOST_FQDN}:10086"
 fi)
 Default Username: admin
 Default Password: admin (CHANGE IMMEDIATELY!)
@@ -585,9 +586,9 @@ WireGuard client configuration can be found at:
 /etc/wireguard/clients/client1.conf
 You can access WGDashboard at:
 $(if [ "$ENABLE_SSL" = true ] && [ -n "$DASHBOARD_HOST" ]; then
-    echo "URL: https://${HOST_FQDN}/wgdashboard/"
+    echo "URL: https://${HOST_FQDN}:10086"
 else
-    echo "URL: http://${HOST_FQDN}/wgdashboard/"
+    echo "URL: http://${HOST_FQDN}:10086"
 fi)
 $(if [ "$INSTALL_NETDATA" = true ]; then
 echo "You can access Netdata monitoring at:"
@@ -650,11 +651,6 @@ upstream netdatabackend {
     keepalive 1024;
 }
 
-upstream wgdashboard {
-    server 127.0.0.1:10086;
-    keepalive 1024;
-}
-
 server {
 	listen 80 default_server;
 	listen [::]:80 default_server;
@@ -683,38 +679,6 @@ server {
   add_header X-Frame-Options SAMEORIGIN;
   add_header Referrer-Policy strict-origin-when-cross-origin;
 
-
-location = /wgdashboard {
-        return 301 /wgdashboard/;
-}
-
-location ~ /wgdashboard/(?<wgdpath>.*) {
-
-        proxy_redirect off;
-        proxy_set_header Host \$host;
-
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Server \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_http_version 1.1;
-        proxy_pass_request_headers on;
-        proxy_set_header Connection "keep-alive";
-        proxy_store off;
-        proxy_pass http://wgdashboard/\$wgdpath\$is_args\$args;
-
-        gzip on;
-        gzip_proxied any;
-        gzip_types *;
-
-
-        access_log /var/log/nginx/wgdashboard.access.log;
-        error_log /var/log/nginx/wgdashboard.error.log;
-
-  }
-
-location = /netdata {
-        return 301 /netdata/;
-}
 
 location ~ /netdata/(?<ndpath>.*) {
 
