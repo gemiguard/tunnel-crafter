@@ -148,7 +148,7 @@ install_packages() {
         ca-certificates lsb-release unattended-upgrades fail2ban ufw git \
         python3 python3-pip python3-venv qrencode wireguard nginx apache2-utils \
         certbot python3-certbot-nginx zlib1g-dev uuid-dev libuv1-dev \
-        liblz4-dev libssl-dev libmnl-dev || error "Failed to install required packages"
+        liblz4-dev libssl-dev libmnl-dev rsyslog || error "Failed to install required packages"
     
     log "All required packages have been installed"
 }
@@ -535,9 +535,9 @@ QR Code: /etc/wireguard/clients/client1_qr.txt
 WGDASHBOARD ACCESS
 --------------------------------------------------------
 $(if [ "$ENABLE_SSL" = true ] && [ -n "$DASHBOARD_HOST" ]; then
-    echo "URL: https://${HOST_FQDN}/wgdashboard/"
+    echo "URL: https://${HOST_FQDN}/"
 else
-    echo "URL: http://${HOST_FQDN}/wgdashboard/"
+    echo "URL: http://${HOST_FQDN}/"
 fi)
 Default Username: admin
 Default Password: admin (CHANGE IMMEDIATELY!)
@@ -585,9 +585,9 @@ WireGuard client configuration can be found at:
 /etc/wireguard/clients/client1.conf
 You can access WGDashboard at:
 $(if [ "$ENABLE_SSL" = true ] && [ -n "$DASHBOARD_HOST" ]; then
-    echo "URL: https://${HOST_FQDN}/wgdashboard/"
+    echo "URL: https://${HOST_FQDN}/"
 else
-    echo "URL: http://${HOST_FQDN}/wgdashboard/"
+    echo "URL: http://${HOST_FQDN}/"
 fi)
 $(if [ "$INSTALL_NETDATA" = true ]; then
 echo "You can access Netdata monitoring at:"
@@ -652,7 +652,6 @@ upstream netdatabackend {
 
 upstream wgdashboard {
     server 127.0.0.1:10086;
-    keepalive 1024;
 }
 
 server {
@@ -684,68 +683,55 @@ server {
   add_header Referrer-Policy strict-origin-when-cross-origin;
 
 
-location = /wgdashboard {
-        return 301 /wgdashboard/;
-}
-
-location ~ /wgdashboard/(?<wgdpath>.*) {
-
-        proxy_redirect off;
-        proxy_set_header Host \$host;
-
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Server \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_http_version 1.1;
-        proxy_pass_request_headers on;
-        proxy_set_header Connection "keep-alive";
-        proxy_store off;
-        proxy_pass http://wgdashboard/\$wgdpath\$is_args\$args;
-
-        gzip on;
-        gzip_proxied any;
-        gzip_types *;
+  location = /netdata {
+          return 301 \$scheme://\$host:\$server_port/netdata/;
+  }
 
 
-        access_log /var/log/nginx/wgdashboard.access.log;
-        error_log /var/log/nginx/wgdashboard.error.log;
+  location ^~ /netdata/ {
+
+          auth_basic "Password Required";
+          auth_basic_user_file /etc/nginx/.htpasswd;
+
+          proxy_redirect off;
+          proxy_set_header Host \$host;
+
+          proxy_set_header X-Forwarded-Host \$host;
+          proxy_set_header X-Forwarded-Server \$host;
+          proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+          proxy_http_version 1.1;
+          proxy_pass_request_headers on;
+          proxy_set_header Connection "keep-alive";
+          proxy_store off;
+          proxy_pass http://netdatabackend/;
+
+          gzip on;
+          gzip_proxied any;
+          gzip_types *;
+
+
+          # Timeout settings
+          proxy_connect_timeout 300s;
+          proxy_read_timeout 300s;
+
+          access_log /var/log/nginx/netdata.access.log;
+          error_log /var/log/nginx/netdata.error.log;
 
   }
 
-location = /netdata {
-        return 301 /netdata/;
-}
 
-location ~ /netdata/(?<ndpath>.*) {
+  location / {
 
-        auth_basic "Password Required";
-        auth_basic_user_file /etc/nginx/.htpasswd;
+          proxy_pass http://wgdashboard;
 
-        proxy_redirect off;
-        proxy_set_header Host \$host;
+          proxy_set_header Host \$host;
+          proxy_set_header X-Real-IP \$remote_addr;
+          proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
 
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Server \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_http_version 1.1;
-        proxy_pass_request_headers on;
-        proxy_set_header Connection "keep-alive";
-        proxy_store off;
-        proxy_pass http://netdatabackend/\$ndpath\$is_args\$args;
+          access_log /var/log/nginx/wgdashboard.access.log;
+          error_log /var/log/nginx/wgdashboard.error.log;
 
-        gzip on;
-        gzip_proxied any;
-        gzip_types *;
-
-
-        # Timeout settings
-        proxy_connect_timeout 300s;
-        proxy_read_timeout 300s;
-
-        access_log /var/log/nginx/netdata.access.log;
-        error_log /var/log/nginx/netdata.error.log;
-
-    }
+  }
 
 
 }
@@ -757,29 +743,42 @@ EOF
 
     # Get SSL certificate
     log "Getting SSL certificate from Let's Encrypt"
-    certbot --nginx -d "$HOST_FQDN" --non-interactive --agree-tos --email "root@$HOST_FQDN" || warning "SSL certificate setup failed"
 
-    # Add strong SSL configuration
-    if ! grep -q "ssl_protocols" /etc/nginx/sites-available/netdata; then
-        # Add strong SSL configuration to the server block
-        sed -i '/server_name/a \
-    # SSL configuration\
-    ssl_protocols TLSv1.2 TLSv1.3;\
-    ssl_prefer_server_ciphers on;\
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;\
-    ssl_session_timeout 1d;\
-    ssl_session_cache shared:SSL:10m;\
-    ssl_session_tickets off;\
-    ssl_stapling on;\
-    ssl_stapling_verify on;\
-    resolver 1.1.1.1 8.8.8.8 valid=300s;\
-    resolver_timeout 5s;\
-    # Add HSTS header with a 1 year max-age\
-    #add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;' /etc/nginx/sites-available/netdata
+    if certbot --nginx -d "$HOST_FQDN" --non-interactive --agree-tos --email "root@$HOST_FQDN"; then
 
-        # Test and restart NGINX
-        nginx -t || error "NGINX config test failure #2"
-        systemctl restart nginx || error "NGINX restart failure #2"
+        log "Let's Encrypt certificate issued - updating NGINX configuration for TLS"
+        # Add strong TLS configuration
+        if ! grep -q "ssl_protocols" /etc/nginx/sites-available/default; then
+            # Add strong SSL configuration to the server block
+            sed -i '/server_name/a \
+        # SSL configuration\
+        ssl_protocols TLSv1.2 TLSv1.3;\
+        ssl_prefer_server_ciphers on;\
+        ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;\
+        ssl_session_timeout 1d;\
+        ssl_session_cache shared:SSL:10m;\
+        ssl_session_tickets off;\
+        ssl_stapling on;\
+        ssl_stapling_verify on;\
+        resolver 1.1.1.1 8.8.8.8 valid=300s;\
+        resolver_timeout 5s;\
+        # Add HSTS header with a 1 year max-age\
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;' /etc/nginx/sites-available/default
+
+            # Test and restart NGINX
+            nginx -t || error "NGINX config test failure #2"
+            systemctl restart nginx || error "NGINX restart failure #2"
+        fi
+    else
+        warning "Let's Encrypt challenge failed - certificate not issued, no SSL/TLS support!"
+        read -rp "To continue without SSL/TLS (not recommended!) enter 'INSECURE' and press RETURN: " NO_TLS_RESPONSE
+        if ! [ "$NO_TLS_RESPONSE" == "INSECURE" ]; then
+            systemctl disable nginx wgdashboard netdata
+            systemctl stop nginx wgdashboard netdata
+            error "User aborted due to no TLS certificate from Let's Encrypt"
+        fi
+        warning "Continuing without SSL/TLS - not recommended!"
+        sleep 3
     fi
 }
 # Main execution
