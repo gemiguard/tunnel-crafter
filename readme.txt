@@ -2,4 +2,4 @@ Script for installation and configuration of WireGuard VPN server, WGDashboard a
 
 Server hardening with ufw, fail2ban, SSH key login, Netdata accessible only after http login and WGDashboard over https.
 
-Script will prompt for confirmation of host, username and SSH login public key.
+Script will prompt for confirmation of host name (for Let's Encrypt SSL certificate), username (for Debian 12 and Netdata) and SSH login public key (which will be applied to Debian 12 root and script-promted user name).
